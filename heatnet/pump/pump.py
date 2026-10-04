@@ -23,6 +23,7 @@ class Pump:
         self._curve = curve
         self._running = False
         self._speed_pct = 0.0
+        self._commanded_speed_pct: float | None = None
         self._flow_t_h = 0.0
         self._target_flow_t_h = 0.0
         self._starts = 0
@@ -75,12 +76,19 @@ class Pump:
 
         return self._stops
 
-    def start(self, speed_pct: float = 100.0) -> float:
+    def start(self, speed_pct: float = 100.0, target_flow_t_h: float | None = None) -> float:
         """启动泵并把目标流量设为该转速对应的流量。"""
 
         self._running = True
         self._starts += 1
-        self._target_flow_t_h = self._curve.flow_for(speed_pct)
+        self._speed_pct = max(
+            self._limits.min_speed_pct, min(self._limits.max_speed_pct, float(speed_pct))
+        )
+        self._commanded_speed_pct = self._speed_pct
+        if target_flow_t_h is None:
+            self._target_flow_t_h = self._curve.flow_for(self._speed_pct)
+        else:
+            self._target_flow_t_h = max(0.0, float(target_flow_t_h))
         return self._target_flow_t_h
 
     def stop(self) -> float:
@@ -89,16 +97,22 @@ class Pump:
         if self._running:
             self._stops += 1
         self._running = False
+        self._commanded_speed_pct = None
         self._target_flow_t_h = 0.0
         return self._target_flow_t_h
 
-    def set_speed(self, speed_pct: float) -> float:
+    def set_speed(self, speed_pct: float, target_flow_t_h: float | None = None) -> float:
         """调整目标转速。"""
 
         self._speed_pct = max(
             self._limits.min_speed_pct, min(self._limits.max_speed_pct, float(speed_pct))
         )
-        self._target_flow_t_h = self._curve.flow_for(self._speed_pct)
+        self._commanded_speed_pct = self._speed_pct
+        self._target_flow_t_h = (
+            self._curve.flow_for(self._speed_pct)
+            if target_flow_t_h is None
+            else max(0.0, float(target_flow_t_h))
+        )
         return self._speed_pct
 
     def step(self, dt: float) -> float:
@@ -114,7 +128,11 @@ class Pump:
             self._flow_t_h += step if delta > 0 else -step
         if self._flow_t_h <= FLOW_EPSILON:
             self._flow_t_h = 0.0
-        self._speed_pct = 0.0 if self._flow_t_h <= FLOW_EPSILON else self._curve.speed_for(self._flow_t_h)
+            self._speed_pct = 0.0
+        elif self._commanded_speed_pct is not None:
+            self._speed_pct = self._commanded_speed_pct
+        else:
+            self._speed_pct = self._curve.speed_for(self._flow_t_h)
         return self._flow_t_h
 
     def snapshot(self) -> PumpSnapshot:

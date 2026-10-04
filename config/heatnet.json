@@ -47,6 +47,15 @@
       "min_speed_pct": 20.0,
       "max_speed_pct": 100.0
     },
+    "pump_group": {
+      "rolling_period_s": 300.0,
+      "energy_priority_start_hour": 22,
+      "energy_priority_end_hour": 6,
+      "rotation_balance_s": 21600.0,
+      "network_resistance": 0.0000173611,
+      "fixed_speed_pct": 100.0,
+      "power_max_age_s": 600.0
+    },
     "pressure": {
       "baseline_min_kpa": 240.0,
       "baseline_max_kpa": 430.0,

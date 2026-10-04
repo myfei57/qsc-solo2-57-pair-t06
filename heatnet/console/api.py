@@ -48,6 +48,8 @@ class Api:
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
+        add("GET", "/api/pump-group", self._pump_group_report)
+        add("GET", "/api/pump-group/preview", self._pump_group_preview)
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
         add("GET", "/api/trend", self._trend)
@@ -72,6 +74,11 @@ class Api:
         add("POST", "/api/zone/split", self._split)
         add("POST", "/api/valve/replay", self._replay)
         add("POST", "/api/pump", self._pump)
+        add("POST", "/api/pump-group/power", self._pump_power)
+        add("POST", "/api/pump-group/schedule", self._pump_schedule)
+        add("POST", "/api/pump-group/optimize", self._pump_schedule)
+        add("POST", "/api/pump-group/start", self._pump_group_start)
+        add("POST", "/api/pump-group/stop", self._pump_group_stop)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/trip", self._trip)
         add("POST", "/api/reset", self._reset)
@@ -171,6 +178,19 @@ class Api:
 
     def _pressure(self, params: dict, body: dict) -> dict:
         return self._platform.pressure_report()
+
+    def _pump_group_report(self, params: dict, body: dict) -> dict:
+        return self._platform.pump_group_report()
+
+    def _pump_group_preview(self, params: dict, body: dict) -> dict:
+        demand = params.get("demand_t_h", params.get("flow_t_h", params.get("load_t_h")))
+        resistance = params.get("resistance", params.get("resistance_coefficient"))
+        hour = params.get("hour")
+        return self._platform.preview_pump_schedule(
+            None if demand is None else float(demand),
+            None if resistance is None else float(resistance),
+            None if hour is None else int(hour),
+        )
 
     def _quota(self, params: dict, body: dict) -> dict:
         return self._platform.quota_report()
@@ -326,6 +346,51 @@ class Api:
         if action == "stop":
             return self._platform.stop_pump()
         return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))
+
+    def _optional_float(self, body: dict, key: str) -> float | None:
+        if key not in body or body[key] is None:
+            return None
+        return _as_float(body, key, 0.0)
+
+    def _pump_power(self, params: dict, body: dict) -> dict:
+        readings = body.get("readings_kw", body.get("readings", body.get("power_readings_kw", {})))
+        if readings is None:
+            readings = {}
+            for name in ("pump-a", "pump-b"):
+                key = f"{name}_kw"
+                if key in body:
+                    readings[name] = body[key]
+        return self._platform.record_pump_power(
+            {str(name): float(value) for name, value in dict(readings).items()},
+            ts=self._optional_float(body, "ts"),
+        )
+
+    def _pump_schedule_arguments(
+        self, body: dict
+    ) -> tuple[float | None, float | None, int | None]:
+        demand = self._optional_float(body, "demand_t_h")
+        if demand is None and "flow_t_h" in body:
+            demand = _as_float(body, "flow_t_h", 0.0)
+        if demand is None and "load_t_h" in body:
+            demand = _as_float(body, "load_t_h", 0.0)
+        resistance = self._optional_float(body, "resistance")
+        if resistance is None and "resistance_coefficient" in body:
+            resistance = _as_float(body, "resistance_coefficient", 0.0)
+        hour = body.get("hour")
+        return demand, resistance, None if hour is None else int(hour)
+
+    def _pump_schedule(self, params: dict, body: dict) -> dict:
+        demand, resistance, hour = self._pump_schedule_arguments(body)
+        return self._platform.schedule_pumps(
+            demand, resistance, hour, engage=bool(body.get("engage", True))
+        )
+
+    def _pump_group_start(self, params: dict, body: dict) -> dict:
+        demand, resistance, hour = self._pump_schedule_arguments(body)
+        return self._platform.start_pump_group(demand, resistance, hour)
+
+    def _pump_group_stop(self, params: dict, body: dict) -> dict:
+        return self._platform.stop_pump_group()
 
     def _disturb(self, params: dict, body: dict) -> dict:
         return self._platform.disturb_secondary(_as_float(body, "heat_fraction", 0.5))

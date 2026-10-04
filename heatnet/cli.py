@@ -30,6 +30,7 @@ DEFAULT_PROBE_PATHS = (
     "/api/topology",
     "/api/audit",
     "/api/stations",
+    "/api/pump-group",
     "/api/quota",
 )
 
@@ -86,6 +87,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     preview = platform.plan_preview(args.demand_pct)
     dispatch = platform.dispatch(args.demand_pct, args.target_c, None, None)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
+    pump_power = platform.record_pump_power({"pump-a": 105.0, "pump-b": 148.0})
+    pump_schedule = platform.schedule_pumps(
+        max(800.0, platform.network.flow_t_h()), hour=23
+    )
     calibration = platform.calibrate_flow(args.baseline_t_h)
     retrofit = platform.retrofit_baseline(args.baseline_kpa)
     secondary = platform.secondary_cycle(args.dt)
@@ -116,6 +121,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         },
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
+        "pump_power": pump_power,
+        "pump_schedule": {
+            key: pump_schedule["schedule"][key]
+            for key in ("mode", "policy", "selected_pump", "speed_pct", "flow_met", "comparison")
+        },
         "calibration": calibration,
         "retrofit": retrofit,
         "secondary": {key: secondary[key] for key in ("ok", "flow_t_h", "pump_idle", "violations")},

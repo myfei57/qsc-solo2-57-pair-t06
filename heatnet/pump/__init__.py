@@ -9,8 +9,22 @@
 from __future__ import annotations
 
 from .curve import PumpCurve
+from .group import PumpGroup
 from .pump import Pump
+from .schedule import PumpSchedule, PumpSpec
+from .scheduler import build_schedule, policy_for_hour
 from .start import start_pump_after_valve, stop_pump_before_valve
 from .state import PumpSnapshot
 
-__all__ = ["Pump", "PumpCurve", "PumpSnapshot", "start_pump_after_valve", "stop_pump_before_valve"]
+__all__ = [
+    "Pump",
+    "PumpCurve",
+    "PumpGroup",
+    "PumpSchedule",
+    "PumpSnapshot",
+    "PumpSpec",
+    "build_schedule",
+    "policy_for_hour",
+    "start_pump_after_valve",
+    "stop_pump_before_valve",
+]

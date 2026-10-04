@@ -28,6 +28,15 @@ def _section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     return value
 
 
+def _optional_section(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any] | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ConfigError(f"配置段落 {key!r} 必须是映射", component="config")
+    return value
+
+
 def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = None) -> float:
     value = section.get(key, _MISSING)
     if value is _MISSING:
@@ -235,6 +244,44 @@ class PumpLimits:
 
 
 @dataclass(frozen=True)
+class PumpGroupLimits:
+    """循环泵组滚动寻优的固定策略。"""
+
+    rolling_period_s: float
+    energy_priority_start_hour: int
+    energy_priority_end_hour: int
+    rotation_balance_s: float
+    network_resistance: float
+    fixed_speed_pct: float
+    power_max_age_s: float
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "PumpGroupLimits":
+        start_hour = _number(section, "energy_priority_start_hour", minimum=0)
+        end_hour = _number(section, "energy_priority_end_hour", minimum=0)
+        start = int(start_hour)
+        end = int(end_hour)
+        if start_hour != start or end_hour != end:
+            raise ConfigError("节电时段小时必须是整数", component="config")
+        limits = cls(
+            rolling_period_s=_number(section, "rolling_period_s", minimum=1.0),
+            energy_priority_start_hour=start,
+            energy_priority_end_hour=end,
+            rotation_balance_s=_number(section, "rotation_balance_s", minimum=0.0),
+            network_resistance=_number(section, "network_resistance", minimum=0.0),
+            fixed_speed_pct=_number(section, "fixed_speed_pct", minimum=0.0),
+            power_max_age_s=_number(section, "power_max_age_s", minimum=1.0),
+        )
+        if not 0 <= start <= 23 or not 0 <= end <= 23 or start == end:
+            raise ConfigError("节电时段必须是两个不同的小时（0-23）", component="config")
+        if limits.fixed_speed_pct > 100.0:
+            raise ConfigError("定速回退转速不得高于 100%", component="config")
+        if limits.network_resistance <= 0.0:
+            raise ConfigError("管网阻力系数必须为正", component="config")
+        return limits
+
+
+@dataclass(frozen=True)
 class PressureLimits:
     """定压基线的许可范围与改造确认时间。"""
 
@@ -289,6 +336,7 @@ class PlatformConfig:
     secondary: SecondaryLimits
     valve: ValveLimits
     pump: PumpLimits
+    pump_group: PumpGroupLimits
     pressure: PressureLimits
     quota: QuotaLimits
 
@@ -303,6 +351,7 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        pump_group_section = _optional_section(limits, "pump_group")
         return cls(
             name=name,
             storage_root=storage_root,
@@ -313,6 +362,11 @@ class PlatformConfig:
             secondary=SecondaryLimits.from_mapping(_section(limits, "secondary")),
             valve=ValveLimits.from_mapping(_section(limits, "valve")),
             pump=PumpLimits.from_mapping(_section(limits, "pump")),
+            pump_group=(
+                PumpGroupLimits.from_mapping(pump_group_section)
+                if pump_group_section is not None
+                else PumpGroupLimits(300.0, 22, 6, 21600.0, 0.0000173611, 100.0, 600.0)
+            ),
             pressure=PressureLimits.from_mapping(_section(limits, "pressure")),
             quota=QuotaLimits.from_mapping(_section(limits, "quota")),
         )
@@ -343,6 +397,7 @@ def default_config() -> PlatformConfig:
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
         valve=ValveLimits(12.0, 1.5),
         pump=PumpLimits(40.0, 20.0, 100.0),
+        pump_group=PumpGroupLimits(300.0, 22, 6, 21600.0, 0.0000173611, 100.0, 600.0),
         pressure=PressureLimits(240.0, 430.0, 6.0),
         quota=QuotaLimits(100000.0, 30.0, 24.0),
     )
@@ -396,6 +451,15 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "ramp_t_h_s": cfg.pump.ramp_t_h_s,
                 "min_speed_pct": cfg.pump.min_speed_pct,
                 "max_speed_pct": cfg.pump.max_speed_pct,
+            },
+            "pump_group": {
+                "rolling_period_s": cfg.pump_group.rolling_period_s,
+                "energy_priority_start_hour": cfg.pump_group.energy_priority_start_hour,
+                "energy_priority_end_hour": cfg.pump_group.energy_priority_end_hour,
+                "rotation_balance_s": cfg.pump_group.rotation_balance_s,
+                "network_resistance": cfg.pump_group.network_resistance,
+                "fixed_speed_pct": cfg.pump_group.fixed_speed_pct,
+                "power_max_age_s": cfg.pump_group.power_max_age_s,
             },
             "pressure": {
                 "baseline_min_kpa": cfg.pressure.baseline_min_kpa,
