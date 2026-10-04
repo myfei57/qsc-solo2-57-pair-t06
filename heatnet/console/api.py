@@ -48,6 +48,7 @@ class Api:
         add("GET", "/api/curve", self._curve)
         add("GET", "/api/forecast", self._forecast)
         add("GET", "/api/pressure", self._pressure)
+        add("GET", "/api/pump-group", lambda params, body: self._platform.pump_group_report())
         add("GET", "/api/quota", self._quota)
         add("GET", "/api/billing", self._billing)
         add("GET", "/api/trend", self._trend)
@@ -66,6 +67,8 @@ class Api:
         add("POST", "/api/cycle", self._cycle)
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/retrofit", self._retrofit)
+        add("POST", "/api/pump-group", self._pump_group)
+        add("POST", "/api/pump-group/power", self._pump_group_power)
         add("POST", "/api/secondary/cycle", self._secondary_cycle)
         add("POST", "/api/meter", self._meter)
         add("POST", "/api/settle", self._settle)
@@ -293,6 +296,26 @@ class Api:
     def _retrofit(self, params: dict, body: dict) -> dict:
         target = _as_float(body, "baseline_kpa", self._platform.pressure.baseline.value_kpa())
         return self._platform.retrofit_baseline(target)
+
+    def _pump_group(self, params: dict, body: dict) -> dict:
+        required = body.get("required_flow_t_h")
+        resistance = body.get("resistance")
+        static = body.get("static_head_m")
+        return self._platform.schedule_pump_group(
+            None if required is None else float(required),
+            None if resistance is None else float(resistance),
+            20.0 if static is None else float(static),
+            _as_float(body, "dt", 1.0),
+            str(body.get("source", "console")),
+        )
+
+    def _pump_group_power(self, params: dict, body: dict) -> dict:
+        power = body.get("power_kw", body)
+        if not isinstance(power, dict):
+            raise ValueError("power_kw 必须是泵名到电耗的映射")
+        return self._platform.report_pump_power(
+            {str(name): float(value) for name, value in power.items()}
+        )
 
     def _secondary_cycle(self, params: dict, body: dict) -> dict:
         return self._platform.secondary_cycle(_as_float(body, "dt", 1.0))

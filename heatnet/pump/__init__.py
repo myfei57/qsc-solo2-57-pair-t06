@@ -9,8 +9,30 @@
 from __future__ import annotations
 
 from .curve import PumpCurve
+from .group import PumpGroup
+from .hydraulics import (
+    NetworkCondition,
+    PowerReading,
+    PumpCharacteristics,
+    PumpSchedule,
+    optimize_pump_schedule,
+    policy_for_timestamp,
+)
 from .pump import Pump
 from .start import start_pump_after_valve, stop_pump_before_valve
 from .state import PumpSnapshot
 
-__all__ = ["Pump", "PumpCurve", "PumpSnapshot", "start_pump_after_valve", "stop_pump_before_valve"]
+__all__ = [
+    "NetworkCondition",
+    "PowerReading",
+    "Pump",
+    "PumpCharacteristics",
+    "PumpCurve",
+    "PumpGroup",
+    "PumpSchedule",
+    "PumpSnapshot",
+    "optimize_pump_schedule",
+    "policy_for_timestamp",
+    "start_pump_after_valve",
+    "stop_pump_before_valve",
+]

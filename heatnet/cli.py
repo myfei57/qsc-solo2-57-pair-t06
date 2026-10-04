@@ -94,6 +94,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     split = platform.split_zone(args.split_zone, args.split_stations, args.new_zone)
     queued = platform.queue_commands(args.station, [55.0, 62.0], "demo-operator")
     replayed = platform.replay_valves([args.station])
+    pump_power = platform.report_pump_power(
+        {name: 260.0 if name.endswith("a") else 230.0 for name in platform.pump_group.names()}
+    )
+    pump_schedule = platform.schedule_pump_group(args.baseline_t_h * 0.55, 0.000002, source="demo")
     disturbance = platform.disturb_secondary(args.disturb)
     concurrency = platform.concurrency_probe(rounds=args.rounds)
     trip = platform.trip("demo-complete")
@@ -124,6 +128,21 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "split": split,
         "queued": queued,
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},
+        "pump_power": pump_power,
+        "pump_schedule": {
+            key: pump_schedule[key]
+            for key in (
+                "optimization",
+                "policy",
+                "mode",
+                "selected_pump",
+                "speed_pct",
+                "power_kw",
+                "fixed_speed",
+                "saving_pct",
+                "degraded",
+            )
+        },
         "disturbance": disturbance,
         "concurrency": concurrency,
         "trip": {key: trip[key] for key in ("ok", "state", "reason", "trips")},

@@ -26,6 +26,15 @@ from .pressure.control import PressurisingController
 from .primary.flow import batch_flows
 from .primary.network import PrimaryNetwork
 from .pump.curve import PumpCurve
+from .pump.group import PumpGroup
+from .pump.hydraulics import (
+    POWER_FRESH_S,
+    ROLLING_PERIOD_S,
+    NetworkCondition,
+    PowerReading,
+    PumpCharacteristics,
+    optimize_pump_schedule,
+)
 from .pump.pump import Pump
 from .quota.accumulator import QuotaAccumulator
 from .quota.billing import billing_lines
@@ -66,6 +75,15 @@ _ZONE_SPECS: tuple[tuple[str, float, tuple[str, ...]], ...] = (
 # 热量表按站登记，回绕阈值取配置值。
 _METER_SUFFIX = ".heat-meter"
 
+# 两台互备循环泵的额定点固定；滚动寻优周期也固定，不提供整点批量模式。
+_PUMP_SPECS = (
+    ("secondary.circulating-a", 320.0),
+    ("secondary.circulating-b", 285.0),
+)
+_PUMP_RATED_HEAD_M = (28.0, 28.0)
+_PUMP_SHUTOFF_HEAD_M = (44.0, 42.0)
+_PUMP_STATIC_HEAD_M = 20.0
+
 
 class Platform:
     """城市集中供热管网调度平台。"""
@@ -105,6 +123,13 @@ class Platform:
         self.stations, self.valves, self.queues = self._build_stations()
         self.service = StationService(self.stations, self.valves, self.durable)
         self.pump: Pump = self._build_pump()
+        self.pump_group = self._build_pump_group()
+        self.pump_characteristics = self._build_pump_characteristics()
+        self._power_readings: dict[str, PowerReading] = {}
+        self._pump_resistance = 0.0
+        self._last_pump_schedule: dict | None = None
+        self._pump_scheduling = False
+        self._last_rolling_schedule_ts = 0.0
 
         self.meters = QuotaAccumulator()
         self.ledger = QuotaLedger(self.config.quota, self.meters)
@@ -155,6 +180,38 @@ class Platform:
         )
         return Pump("secondary.circulating", self.config.pump, curve)
 
+    def _build_pump_group(self) -> PumpGroup:
+        """构造两台互备循环泵。"""
+
+        baseline = self.config.primary.flow_baseline_t_h
+        pumps = []
+        for name, _ in _PUMP_SPECS:
+            curve = PumpCurve(
+                self.config.pump.min_speed_pct,
+                self.config.pump.max_speed_pct,
+                baseline * 0.25,
+                baseline,
+            )
+            pumps.append(Pump(name, self.config.pump, curve))
+        return PumpGroup(pumps)
+
+    def _build_pump_characteristics(self) -> list[PumpCharacteristics]:
+        """构造与泵组同名的水力与电耗模型。"""
+
+        baseline = self.config.primary.flow_baseline_t_h
+        return [
+            PumpCharacteristics(
+                name=name,
+                rated_flow_t_h=baseline,
+                rated_head_m=_PUMP_RATED_HEAD_M[index],
+                shutoff_head_m=_PUMP_SHUTOFF_HEAD_M[index],
+                rated_power_kw=power_kw,
+                min_speed_pct=self.config.pump.min_speed_pct,
+                max_speed_pct=self.config.pump.max_speed_pct,
+            )
+            for index, (name, power_kw) in enumerate(_PUMP_SPECS)
+        ]
+
     def _build_meters(self) -> None:
         """按站登记热量表。"""
 
@@ -170,7 +227,6 @@ class Platform:
             ("plant", "weather", "weather-gateway"),
             ("primary", "supply_header", "header"),
             ("primary", "flow_meter", "flow-meter"),
-            ("secondary", "circulating_pump", "pump"),
             ("secondary", "makeup_valve", "control-valve"),
             ("secondary", "pressure_sensor", "pressure-sensor"),
         ):
@@ -179,6 +235,8 @@ class Platform:
             self.namespaces.register("station", name, "heat-exchange-station")
             self.namespaces.register("valve", f"{name}.mix", "mix-valve")
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
+        for name in self.pump_group.names():
+            self.namespaces.register("secondary", name, "circulating-pump")
 
     def _restore(self) -> None:
         """从落盘状态恢复平台计数与阀门开度。"""
@@ -187,6 +245,14 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+            group_state = state.get("pump_group")
+            if isinstance(group_state, dict):
+                runtime = group_state.get("runtime_s", {})
+                if isinstance(runtime, dict):
+                    for name in self.pump_group.names():
+                        self.pump_group.state.runtime_s[name] = float(runtime.get(name, 0.0))
+                self.pump_group.state.switches = int(group_state.get("switches", 0))
+                self.pump_group.state.last_switch_ts = float(group_state.get("last_switch_ts", 0.0))
         for name, valve in self.valves.items():
             load_valve(valve, self.durable)
             applied = self.checkpoint.load(name)
@@ -207,7 +273,18 @@ class Platform:
 
         self.store.write(
             "platform_state",
-            {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
+            {
+                "operations": self._operations,
+                "cycles": self._cycles,
+                "unit": self.unit,
+                "pump_group": {
+                    "running_pump": self.pump_group.state.running_pump,
+                    "requested_pump": self.pump_group.state.requested_pump,
+                    "last_switch_ts": self.pump_group.state.last_switch_ts,
+                    "runtime_s": dict(self.pump_group.state.runtime_s),
+                    "switches": self.pump_group.state.switches,
+                },
+            },
         )
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
@@ -318,6 +395,7 @@ class Platform:
 
         with self._lock:
             op_id = self.ids.next()
+            pump_group_stop = self.pump_group.stop_all()
             report = shutdown_plant(
                 self.source,
                 self.network,
@@ -326,6 +404,7 @@ class Platform:
                 self.valves[sorted(self.valves)[0]],
                 reason,
             )
+            report["pump_group_stop"] = pump_group_stop
             summary = self._record_operation(op_id, "shutdown", report)
             self._operations += 1
             self._persist()
@@ -455,6 +534,131 @@ class Platform:
             self._persist()
             return {**report, **summary}
 
+    def report_pump_power(self, power_kw: dict[str, float]) -> dict:
+        """采集两台泵的最新电耗；读数必须逐台上报且非负。"""
+
+        with self._lock:
+            names = set(self.pump_group.names())
+            provided = set(power_kw)
+            missing = sorted(names - provided)
+            unknown = sorted(provided - names)
+            if missing or unknown:
+                raise ValueError(f"电耗读数必须覆盖两台泵，missing={missing}, unknown={unknown}")
+            now = self.clock.now()
+            readings: dict[str, PowerReading] = {}
+            for name in self.pump_group.names():
+                value = float(power_kw[name])
+                if value < 0.0:
+                    raise ValueError("电耗不能为负")
+                readings[name] = PowerReading(name, value, now)
+            self._power_readings = readings
+            return {
+                "ok": True,
+                "ts": round(now, 3),
+                "power_kw": {name: round(readings[name].power_kw, 3) for name in readings},
+                "fresh_s": POWER_FRESH_S,
+            }
+
+    def schedule_pump_group(
+        self,
+        required_flow_t_h: float | None = None,
+        resistance: float | None = None,
+        static_head_m: float = _PUMP_STATIC_HEAD_M,
+        dt: float = 1.0,
+        source: str = "console",
+    ) -> dict:
+        """按周期滚动口径计算并执行本轮泵组调度。"""
+
+        with self._lock:
+            demand = (
+                self.network.flow_t_h() if required_flow_t_h is None else float(required_flow_t_h)
+            )
+            current_resistance = self._pump_resistance if resistance is None else float(resistance)
+            if demand < 0.0:
+                raise ValueError("需求流量不能为负")
+            if current_resistance < 0.0:
+                raise ValueError("管网阻力不能为负")
+            if static_head_m < 0.0:
+                raise ValueError("静扬程不能为负")
+            self._pump_resistance = current_resistance
+            now = self.clock.now()
+            network = NetworkCondition(demand, current_resistance, static_head_m)
+            schedule = optimize_pump_schedule(
+                self.pump_characteristics,
+                network,
+                dict(self._power_readings),
+                now=now,
+                runtime_s=dict(self.pump_group.state.runtime_s),
+                current_pump=self.pump_group.running_pump(),
+                current_speed_pct=self.pump_group.speed_of_running(),
+                last_switch_ts=self.pump_group.last_switch_ts(),
+                period_s=ROLLING_PERIOD_S,
+                power_fresh_s=POWER_FRESH_S,
+            )
+            execution = self.pump_group.apply(schedule, now, dt)
+            delivered = self.pump_group.get(schedule.selected_pump).flow_t_h()
+            if delivered > 0.0:
+                self.network.set_flow(delivered)
+            if execution["running_pump"] != schedule.selected_pump:
+                raise RuntimeError("泵组执行结果与调度结果不一致")
+            self._last_pump_schedule = schedule.as_dict()
+            self._last_pump_schedule.update(
+                {
+                    "execution": execution,
+                    "resistance": current_resistance,
+                    "static_head_m": static_head_m,
+                    "source": source,
+                }
+            )
+            self._pump_scheduling = True
+            self._last_rolling_schedule_ts = now
+            severity = "warning" if schedule.degraded else "notice"
+            message = "泵组滚动调度（电耗缺失，退回定速）" if schedule.degraded else "泵组滚动调度"
+            self.bus.publish(
+                Event.of(
+                    "pump_group",
+                    "pump_group",
+                    "pump_group_scheduled",
+                    severity=severity,
+                    message=message,
+                    asset=schedule.selected_pump,
+                    source=source,
+                    **{
+                        key: value
+                        for key, value in self._last_pump_schedule.items()
+                        if key not in ("candidates", "source")
+                    },
+                    candidates=self._last_pump_schedule["candidates"],
+                )
+            )
+            return dict(self._last_pump_schedule)
+
+    def _auto_schedule_pump_group(self, moment: float, dt: float) -> None:
+        if not self._pump_scheduling:
+            return
+        if moment - self._last_rolling_schedule_ts + 1e-9 < ROLLING_PERIOD_S:
+            return
+        self.schedule_pump_group(
+            required_flow_t_h=self.network.flow_t_h(),
+            resistance=self._pump_resistance,
+            dt=dt,
+            source="rolling-cycle",
+        )
+
+    def pump_group_report(self) -> dict:
+        """返回泵组调度报告；控制台和审计都引用这一个口径。"""
+
+        return {
+            "optimization": "periodic_rolling",
+            "period_s": ROLLING_PERIOD_S,
+            "power_fresh_s": POWER_FRESH_S,
+            "enabled": self._pump_scheduling,
+            "last_schedule_ts": round(self._last_rolling_schedule_ts, 3),
+            "resistance": self._pump_resistance,
+            "group": self.pump_group.snapshot(),
+            "latest_schedule": self._last_pump_schedule,
+        }
+
     def start_pump(self, speed_pct: float = 85.0) -> dict:
         """启动循环泵。"""
 
@@ -466,12 +670,18 @@ class Platform:
         """停循环泵。"""
 
         with self._lock:
+            group = self.pump_group.stop_all()
             self.pump.stop()
             for _ in range(600):
                 self.pump.step(1.0)
                 if self.pump.idle():
                     break
-            return {"running": self.pump.running(), "flow_t_h": round(self.pump.flow_t_h(), 2)}
+            self._pump_scheduling = False
+            return {
+                "running": self.pump.running(),
+                "flow_t_h": round(self.pump.flow_t_h(), 2),
+                "pump_group": group,
+            }
 
     def disturb_secondary(self, heat_fraction: float) -> dict:
         """向二次网注入一次热负荷扰动。"""
@@ -625,6 +835,9 @@ class Platform:
             self._cycles += 1
             self.clock.sleep(dt)
             moment = self.clock.now()
+            if self.pump_group.running_pump():
+                self.pump_group.tick(dt)
+            self._auto_schedule_pump_group(moment, dt)
             flow = self.source.flow_t_h() or self.network.flow_t_h()
             report = advance_heating(
                 self.source, self.curve, self.network, self.secondary, flow, moment, dt
@@ -794,6 +1007,7 @@ class Platform:
             "secondary": self.secondary.snapshot().as_dict(),
             "pressure": self.pressure_report(),
             "pump": {**self.pump.snapshot().as_dict(), "curve": self.pump.curve.describe()},
+            "pump_group": self.pump_group_report(),
             "stations": {
                 "count": len(self.stations),
                 "service": {

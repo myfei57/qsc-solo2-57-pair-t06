@@ -110,7 +110,7 @@ def test_snapshot_exposes_all_sections(online):
     for key in ("status", "topology", "namespaces", "zones", "mapping", "trend", "billing"):
         assert key in snapshot
     assert snapshot["topology"]["order"][0] == "weather"
-    assert snapshot["namespaces"]["count"] == 25
+    assert snapshot["namespaces"]["count"] == 26
     assert snapshot["status"]["stations"]["count"] == 6
 
 
